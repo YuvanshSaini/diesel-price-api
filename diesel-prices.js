@@ -9,16 +9,24 @@ const PORT = process.env.PORT || 3000;
 let cache = { data: null, lastUpdated: null };
 
 async function fetchDieselPrices() {
-  const { data: html } = await axios.get(
-    "https://www.goodreturns.in/diesel-price-in-india.html",
-    {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
-      },
-      timeout: 15000,
-    }
-  );
+  let html;
+
+  // Case 1: Goodreturns is down or unreachable
+  try {
+    const response = await axios.get(
+      "https://www.goodreturns.in/diesel-price-in-india.html",
+      {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+        },
+        timeout: 15000,
+      }
+    );
+    html = response.data;
+  } catch (err) {
+    throw new Error("Unable to reach Goodreturns.in. Please try again later.");
+  }
 
   const $ = cheerio.load(html);
   const results = [];
@@ -40,6 +48,11 @@ async function fetchDieselPrices() {
       }
     });
 
+  // Case 2: Page loaded but table structure changed / no data parsed
+  if (results.length === 0) {
+    throw new Error("Data unavailable. Goodreturns.in page structure may have changed.");
+  }
+
   const seen = new Set();
   return results.filter((s) => (seen.has(s.state) ? false : seen.add(s.state)));
 }
@@ -58,7 +71,12 @@ app.get("/api/diesel", async (req, res) => {
       data: cache.data,
     });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    // Case 3: Cache is empty and fetch failed — nothing to serve
+    res.status(503).json({
+      success: false,
+      error: err.message,
+      message: "Service temporarily unavailable. Try again shortly.",
+    });
   }
 });
 
@@ -71,11 +89,24 @@ app.get("/api/diesel/:state", async (req, res) => {
     const match = cache.data.find((s) =>
       s.state.toLowerCase().includes(req.params.state.toLowerCase())
     );
+    // Case 4: State name not found
     if (!match)
-      return res.status(404).json({ success: false, error: "State not found" });
-    res.json({ success: true, source: "Goodreturns.in", lastUpdated: cache.lastUpdated, data: match });
+      return res.status(404).json({
+        success: false,
+        error: `"${req.params.state}" not found. Check the state name and try again.`,
+      });
+    res.json({
+      success: true,
+      source: "Goodreturns.in",
+      lastUpdated: cache.lastUpdated,
+      data: match,
+    });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(503).json({
+      success: false,
+      error: err.message,
+      message: "Service temporarily unavailable. Try again shortly.",
+    });
   }
 });
 
@@ -89,7 +120,20 @@ app.post("/api/refresh", async (req, res) => {
       lastUpdated: cache.lastUpdated,
     });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    // Case 5: Refresh failed — keep serving stale cache if available
+    if (cache.data) {
+      return res.status(200).json({
+        success: false,
+        error: err.message,
+        message: "Refresh failed. Serving cached data from last successful fetch.",
+        lastUpdated: cache.lastUpdated,
+      });
+    }
+    res.status(503).json({
+      success: false,
+      error: err.message,
+      message: "Refresh failed and no cached data available.",
+    });
   }
 });
 
